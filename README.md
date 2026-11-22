@@ -53,7 +53,7 @@ API:
 
 | Backend    | Detected when                          | What it does                                            |
 | ---------- | -------------------------------------- | ------------------------------------------------------- |
-| herdr-core | `$HC_TERMINAL_SOCKET` is set (you're in a `hc`/`herdr-app` terminal) | one SSH **terminal** per host, labeled `cssh=<group>`, `host=<name>`; keystrokes mirrored from the calling terminal to the others |
+| herdr-app  | `$HC_TERMINAL_SOCKET` is set (you're in a `hc`/`herdr-app` terminal) | a **tiled space** in the running Herdr window: `space.new` (or a tab with `-c`) for the first host, then `pane.split` right/down for the rest, so N hosts fill a grid — the tmux-cssh split view. Keystrokes typed in any pane of the group are mirrored to the others. |
 | herdr      | `~/.config/herdr/herdr.sock` (or `$HERDR_SOCKET_PATH`) is live | a new **workspace** with a **tiled tab** — one labeled pane per host; keystrokes mirrored from the focused pane to the others |
 
 `herdr-cssh --list` shows the active backend and every candidate socket with
@@ -61,27 +61,31 @@ its state.
 
 ## How it works
 
-1. **Detect the runtime.** herdr-core first (when `$HC_TERMINAL_SOCKET` is
-   live), then the herdr JSON API (default-session socket, then named-session
+1. **Detect the runtime.** herdr-app/herdr-core first (when `$HC_TERMINAL_SOCKET`
+   is live), then the herdr JSON API (default-session socket, then named-session
    sockets).
-2. **Create the sessions.**
-   - *herdr-core*: `terminal.run` once per host, each with a `cssh`/`host`
-     label, no parent (so they survive this process).
+2. **Build the tiled layout.**
+   - *herdr-app*: `space.new --name <group> --folder <cwd> --argv [ssh, …host]`
+     for the first host (or `tab.new` in the current space with `-c`), then
+     `pane.split --direction right|down` on the first pane for each remaining
+     host, tiling them into a grid. Each terminal is labeled `cssh=<group>`,
+     `host=<name>`.
    - *herdr*: `workspace.create` (or reuse the current workspace with `-c`),
      then `layout.apply` with a balanced BSP split tree — one pane per host,
      each running `ssh <host>` and labeled.
 3. **Mirror keystrokes.**
-   - *herdr-core*: observes the calling terminal's surface and replays input
-     to the other terminals via `terminal.send`.
+   - *herdr-app*: observes each terminal's surface and replays input to the
+     other terminals of the group via `terminal.send`.
    - *herdr*: subscribes to `pane.focused` events, tracks the focused pane,
      and mirrors input to the others.
 
 ## Notes
 
+- A host whose SSH session exits (unreachable, auth failure, `exit`) closes its
+  pane; the rest of the grid stays and keeps syncing. Use `-o` to add ssh args
+  (`-o ConnectTimeout=5`, `-o BatchMode=yes`, `-J` jump hosts, etc.).
 - The headless `herdr` server exits when no TUI client is attached; for the
   herdr backend, run `herdr` first (or attach a client), then run
   `herdr-cssh` from a shell.
-- Unreachable hosts: the SSH terminal exits and (in herdr-core) is auto-removed;
-  the remaining sessions keep syncing.
-- The balanced herdr layout splits panes evenly (4 hosts → 2×2 grid, 6 → two
-  rows of three).
+- The herdr-app backend needs the Herdr window open (it drives the running
+  window). The herdr backend works headless.
