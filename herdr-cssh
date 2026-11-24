@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 """herdr-cssh — ClusterSSH with Herdr.
 
-Spawns one SSH session per host — each labeled with its host name — and then
-stays alive in the foreground, mirroring your keystrokes to every session at
-once so typing reaches them all. Think tmux-cssh / ClusterSSH without a Tk
-GUI: one place, many hosts.
+Spawns one SSH session per host — each labeled with its host name — with your
+keystrokes mirrored to every session at once so typing in any pane reaches
+them all. Think tmux-cssh / ClusterSSH without a Tk GUI: one place, many hosts.
 
-It talks to a running Herdr server over its local socket API, so it works
-from any shell — inside a Herdr terminal or not. Two backends are supported
-and auto-detected:
+It talks to a running Herdr server over its local socket API, so it works from
+any shell — inside a Herdr terminal or not. Two backends are supported and
+auto-detected:
 
   herdr-app   (the `herdr-app` window over `herdr-core` / `hc`)
       Detected when $HC_TERMINAL_SOCKET is set. A tiled space in the running
       Herdr window: one SSH pane per host (space.new, then pane.split
-      right/down), the tmux-cssh split view. Keystrokes typed in any pane of
-      the group are mirrored to the others.
+      right/down), the tmux-cssh split view.
 
-  herdr       (the `herdr` 0.9.x JSON socket API)
+  herdr       (the `herdr` JSON socket API)
       Detected via ~/.config/herdr/herdr.sock (or $HERDR_SOCKET_PATH). A new
       workspace is created with a tiled tab — one labeled pane per host —
-      and keystrokes are mirrored from the focused pane to the others.
+      (or a tab in the current workspace with -c).
+
+How mirroring works
+-------------------
+Herdr cannot report what you type in a pane, so every pane runs its program
+through a tiny pty wrapper (this same script in `--pane` mode). The wrapper
+runs the program on a pty, passes your keystrokes to it, and forwards them to
+the sibling wrappers over unix datagram sockets in a temporary directory.
+Received keystrokes are written only to the local program, so nothing loops.
+The launcher creates the panes, writes the group state, and exits; the
+wrappers keep the group alive and clean the directory up when the last pane
+closes.
+
+Keys (prefix is Ctrl-], typed in any pane):
+  Ctrl-] t   toggle broadcast on/off for all panes (labels show [solo] when off)
+  Ctrl-] q   close all host panes
+  Ctrl-] ]   send a literal Ctrl-] to the program
 
 Usage:
     herdr-cssh [options] host [host ...]
@@ -27,24 +41,33 @@ Usage:
 Options:
   -h              Show help
   -p <program>    Run <program> <host> instead of ssh <host> (default: ssh)
-  -c              herdr backend: open a tab in the current workspace instead
-                  of a new one
+  -c              open the group in the current workspace/space instead of a
+                  new one
   -n <name>       Name of the group / workspace / tab (default: cssh)
   -o <ssh args>   Additional arguments passed to the program before the host
 
 Run `herdr-cssh --list` to see which Herdr socket is available to this user.
 """
 
+import fcntl
+import glob
 import json
 import os
+import pty
 import select
+import shutil
 import signal
 import socket
 import subprocess
 import sys
-import threading
+import tempfile
+import termios
+import tty
 
 PROG = "herdr-cssh"
+SELF = os.path.abspath(__file__)
+PREFIX = b"\x1d"  # Ctrl-]
+CHUNK = 1024      # unix datagrams are small; split big pastes
 
 
 def die(msg, code=1):
@@ -60,79 +83,61 @@ def usage(code=0):
 # --------------------------------------------------------------------------
 # Backends
 # --------------------------------------------------------------------------
-# Each backend is a callable: run(hosts, opts) -> None. opts is a dict with
-# keys: program, ssh_options, name, current, cwd, socket_path, caller.
-# The backend creates the host sessions, then blocks mirroring keystrokes
-# from the source (caller / focused pane) to the others until Ctrl-C.
-
 
 class HerdrJson:
-    """Request/response client for the herdr 0.9.x JSON socket API."""
+    """Client for the herdr JSON socket API.
+
+    The herdr server answers one request per connection and then closes it, so
+    every request opens a fresh connection. (events.subscribe is the one
+    request that keeps a connection open to stream events; this client does
+    not use it — the per-pane wrappers do the mirroring.)
+    """
 
     def __init__(self, path):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(10)
-        self.sock.connect(path)
-        self.buf = b""
-        self.next_id = 0
-        self.lock = threading.Lock()
-        self._closed = False
+        self.path = path
 
-    def _read_msg(self):
-        while True:
-            while b"\n" in self.buf:
-                line, self.buf = self.buf.split(b"\n", 1)
-                line = line.strip()
-                if line:
-                    return json.loads(line)
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                self._closed = True
-                raise ConnectionError("socket closed")
-            self.buf += chunk
-
-    def request(self, method, params=None):
-        self.next_id += 1
-        rid = f"r{self.next_id}"
-        with self.lock:
-            self.sock.sendall(
-                json.dumps({"id": rid, "method": method, "params": params or {}})
+    def request(self, method, params=None, timeout=10):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(self.path)
+            s.sendall(
+                json.dumps({"id": "r", "method": method, "params": params or {}})
                 .encode() + b"\n"
             )
+            buf = b""
             while True:
-                msg = self._read_msg()
-                if msg.get("id") == rid:
-                    if "error" in msg:
-                        err = msg["error"]
-                        raise RuntimeError(
-                            f"{method}: {err.get('code')} {err.get('message')}"
-                        )
-                    return msg["result"]
-
-    def poll_event(self, timeout=1.0):
-        self.sock.settimeout(timeout)
-        try:
-            with self.lock:
-                try:
-                    return self._read_msg()
-                except socket.timeout:
-                    return None
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if line:
+                        msg = json.loads(line)
+                        if "error" in msg:
+                            err = msg["error"]
+                            raise RuntimeError(
+                                f"{method}: {err.get('code')} {err.get('message')}"
+                            )
+                        return msg["result"]
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise ConnectionError(f"{method}: socket closed")
+                buf += chunk
         finally:
-            self.sock.settimeout(10)
-
-    def close(self):
-        with self.lock:
-            if self._closed:
-                return
-            self._closed = True
             try:
-                self.sock.close()
+                s.close()
             except OSError:
                 pass
 
+    def close(self):
+        pass
+
 
 class HcCore:
-    """Client for the herdr-core JSON-RPC 2.0 socket API (hc)."""
+    """Client for the herdr-core JSON-RPC 2.0 socket API (hc).
+
+    Unlike the herdr JSON API, the hc socket stays open across many requests,
+    so this client reuses a single connection.
+    """
 
     def __init__(self, path):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -234,86 +239,6 @@ def _current_pane():
     return None, None
 
 
-def run_core(hosts, opts):
-    """herdr-app backend: a tiled space, one SSH pane per host.
-
-    Builds the tmux-cssh-style split view in the running Herdr window:
-    -c opens a tab in the current space, otherwise a new space named after
-    the group. Hosts are tiled via space.new (first host) then pane.split
-    (right, then down) on the first pane, so N hosts fill a grid.
-    Keystrokes typed into any pane of the group are mirrored to the others.
-    """
-    path = opts["socket_path"]
-    h = HcCore(path)
-    cwd = opts["cwd"]
-    name = opts["name"]
-
-    terminals = []  # (host, terminal_address) in layout order
-    space_id = None
-
-    try:
-        if opts["current"]:
-            space_id, base_pane = _current_pane()
-            if not space_id:
-                die("could not find the focused Herdr space; is a space shown?")
-            # First host goes into a new tab of the current space.
-            r = app_do("tab.new", "--name", name, "--space", space_id,
-                        "--folder", cwd, "--argv",
-                        json.dumps(host_argv(hosts[0], opts["program"], opts["ssh_options"])),
-                        "--focus", "false")
-            term = r.get("terminal") or r.get("pane")
-            terminals.append((hosts[0], term))
-        else:
-            r = app_do("space.new", "--name", name, "--folder", cwd,
-                        "--argv",
-                        json.dumps(host_argv(hosts[0], opts["program"], opts["ssh_options"])),
-                        "--focus", "false")
-            space_id = r.get("space")
-            term = r.get("terminal")
-            terminals.append((hosts[0], term))
-
-        # Tiled positions for the remaining hosts: right, down, right, down...
-        # Splitting the first pane repeatedly gives a grid that fills in order.
-        directions = ["right", "down"] * 16
-        first_term = terminals[0][1]
-        for i, host in enumerate(hosts[1:]):
-            pane = _pane_for(space_id, first_term)
-            if not pane:
-                # First pane disappeared (host exited); split the last live one.
-                pane = _last_pane(space_id)
-            if not pane:
-                sys.stderr.write(f"{PROG}: could not place {host}; no live pane to split\n")
-                continue
-            direction = directions[i]
-            r = app_do("pane.split", "--direction", direction, "--pane", pane,
-                        "--argv",
-                        json.dumps(host_argv(host, opts["program"], opts["ssh_options"])))
-            term = r.get("terminal")
-            terminals.append((host, term))
-
-        # Label every terminal for the group (sync target set + identification).
-        for host, term in terminals:
-            if term:
-                try:
-                    h.request("terminal.label",
-                              {"terminal": term, "labels": {"cssh": name, "host": host}})
-                except Exception:
-                    pass
-
-        # Select the group so it is the one shown.
-        app_do("space.select", "--id", space_id)
-
-        sys.stderr.write(
-            f"{PROG}: {len(terminals)} host(s) tiled in space '{name}' "
-            f"({[t for _, t in terminals]})\n"
-            f"{PROG}: typing in any pane of the group syncs to the others; "
-            f"Ctrl-C stops.\n"
-        )
-        _mirror_core(h, path, [t for _, t in terminals if t])
-    finally:
-        h.close()
-
-
 def _last_pane(space_id):
     """Return the last pane ID in a space (fallback split target)."""
     try:
@@ -330,69 +255,6 @@ def _last_pane(space_id):
                     panes.append(t["pane"])
         return panes[-1] if panes else None
     return None
-
-
-def _mirror_core(h, path, terminals):
-    """Mirror keystrokes to every terminal in `terminals`.
-
-    Observes each terminal's surface; input seen on one is replayed to the
-    rest. (Best-effort: a terminal whose surface is unreadable is skipped.)
-    """
-    stop = {"stop": False}
-
-    def on_sig(_s, _f):
-        stop["stop"] = True
-
-    try:
-        signal.signal(signal.SIGINT, on_sig)
-        signal.signal(signal.SIGTERM, on_sig)
-    except ValueError:
-        pass
-
-    # One observe connection per terminal.
-    conns = []
-    for term in terminals:
-        try:
-            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c.settimeout(0.3)
-            c.connect(path)
-            c.sendall(
-                json.dumps(
-                    {"id": "a1", "jsonrpc": "2.0", "method": "terminal.attach",
-                     "params": {"terminal": term, "observe": True, "cols": 200, "rows": 50}}
-                ).encode() + b"\n"
-            )
-            conns.append((term, c))
-        except OSError:
-            pass
-
-    try:
-        while not stop["stop"]:
-            rlist, _, _ = select.select([c for _, c in conns], [], [], 0.3)
-            for c in rlist:
-                term = next(t for t, cc in conns if cc is c)
-                try:
-                    data = c.recv(65536)
-                except (BlockingIOError, socket.timeout):
-                    continue
-                except OSError:
-                    data = b""
-                if not data:
-                    continue
-                text = data.decode("utf-8", "replace")
-                for other in terminals:
-                    if other == term:
-                        continue
-                    try:
-                        h.request("terminal.send", {"terminal": other, "text": text})
-                    except Exception:
-                        pass
-    finally:
-        for _, c in conns:
-            try:
-                c.close()
-            except OSError:
-                pass
 
 
 def balanced_tree(nodes):
@@ -418,106 +280,424 @@ def collect_pane_ids(node, acc):
     return acc
 
 
-def run_herdr(hosts, opts):
-    """herdr 0.9.x backend: a tiled tab, one labeled pane per host."""
+# --------------------------------------------------------------------------
+# Rendezvous: one unix socket per pane + state.json
+# --------------------------------------------------------------------------
+
+def make_rdir():
+    # Under /tmp: unix socket paths have a short length limit.
+    return tempfile.mkdtemp(prefix="herdr-cssh-", dir="/tmp")
+
+
+def write_state(rdir, state):
+    tmp = os.path.join(rdir, "state.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, os.path.join(rdir, "state.json"))
+
+
+def pane_command(idx, host, rdir, program, ssh_options):
+    """argv for one pane: the pty wrapper running the program for `host`."""
+    return [sys.executable, SELF, "--pane", str(idx), "--dir", rdir,
+            "--label", host, "--", *host_argv(host, program, ssh_options)]
+
+
+# --------------------------------------------------------------------------
+# Launcher backends
+# --------------------------------------------------------------------------
+
+def run_core(hosts, opts):
+    """herdr-app backend: a tiled space, one wrapper pane per host.
+
+    Builds the tmux-cssh-style split view in the running Herdr window:
+    -c opens a tab in the current space, otherwise a new space named after the
+    group. Hosts are tiled via space.new (first host) then pane.split (right,
+    then down) on the first pane. Each pane runs the pty wrapper, which does
+    the keystroke mirroring; the launcher writes the group state and exits.
+    """
     path = opts["socket_path"]
-    h = HerdrJson(path)
+    h = HcCore(path)
+    cwd = opts["cwd"]
+    name = opts["name"]
+    rdir = make_rdir()
+
+    terminals = []  # (host, terminal_address) in layout order
+    space_id = None
+
     try:
         if opts["current"]:
-            try:
-                cur = h.request("pane.current", {})
-                workspace_id = cur["pane"]["workspace_id"]
-            except Exception as e:
-                die(f"could not read the current Herdr pane ({e}); is a pane focused?")
-            tabs = h.request("tab.list", {"workspace_id": workspace_id})["tabs"]
-            used = {t.get("label") for t in tabs}
-            label, n = opts["name"], 0
-            while label in used:
-                n += 1
-                label = f"{opts['name']}-{n}"
+            space_id, base_pane = _current_pane()
+            if not space_id:
+                shutil.rmtree(rdir, ignore_errors=True)
+                die("could not find the focused Herdr space; is a space shown?")
+            r = app_do("tab.new", "--name", name, "--space", space_id,
+                        "--folder", cwd, "--argv",
+                        json.dumps(pane_command(0, hosts[0], rdir,
+                                                opts["program"], opts["ssh_options"])),
+                        "--focus", "false")
+            terminals.append((hosts[0], r.get("terminal") or r.get("pane")))
         else:
-            ws = h.request("workspace.create",
-                           {"label": opts["name"], "cwd": opts["cwd"]})
-            workspace_id = ws["workspace"]["workspace_id"]
-            label = opts["name"]
+            r = app_do("space.new", "--name", name, "--folder", cwd,
+                        "--argv",
+                        json.dumps(pane_command(0, hosts[0], rdir,
+                                                opts["program"], opts["ssh_options"])),
+                        "--focus", "false")
+            space_id = r.get("space")
+            terminals.append((hosts[0], r.get("terminal")))
 
-        panes = [
-            {
-                "type": "pane",
-                "label": host,
-                "cwd": opts["cwd"],
-                "command": host_argv(host, opts["program"], opts["ssh_options"]),
-            }
-            for host in hosts
-        ]
-        root = balanced_tree(panes)
-        result = h.request(
-            "layout.apply",
-            {
-                "workspace_id": workspace_id,
-                "tab_label": label,
-                "focus": True,
-                "root": root,
-            },
-        )
-        layout = result["layout"]
-        tab_id = layout["tab_id"]
-        pane_ids = collect_pane_ids(layout["root"], [])
+        # Tiled positions for the remaining hosts: right, down, right, down...
+        directions = ["right", "down"] * 16
+        first_term = terminals[0][1]
+        idx = 1
+        for host in hosts[1:]:
+            pane = _pane_for(space_id, first_term)
+            if not pane:
+                pane = _last_pane(space_id)
+            if not pane:
+                sys.stderr.write(f"{PROG}: could not place {host}; no live pane to split\n")
+                idx += 1
+                continue
+            direction = directions[idx - 1]
+            r = app_do("pane.split", "--direction", direction, "--pane", pane,
+                        "--argv",
+                        json.dumps(pane_command(idx, host, rdir,
+                                                opts["program"], opts["ssh_options"])))
+            terminals.append((host, r.get("terminal")))
+            idx += 1
+
+        # Initial labels (the wrappers update these on broadcast toggle).
+        for host, term in terminals:
+            if term:
+                try:
+                    h.request("terminal.label",
+                              {"terminal": term, "labels": {"cssh": name, "host": host}})
+                except Exception:
+                    pass
+
+        alive = [(hst, t) for hst, t in terminals if t]
+        write_state(rdir, {
+            "backend": "core",
+            "socket": path,
+            "space": space_id,
+            "group": name,
+            "terminals": [t for _, t in alive],
+            "labels": [hst for hst, _ in alive],
+        })
+
+        app_do("space.select", "--id", space_id)
 
         sys.stderr.write(
-            f"{PROG}: {len(panes)} host(s) in tab '{label}' "
-            f"(workspace {workspace_id}, herdr)\n"
-            f"{PROG}: typing in the focused pane syncs to the others; "
-            f"Ctrl-C stops.\n"
+            f"{PROG}: {len(alive)} host(s) tiled in space '{name}'\n"
+            f"{PROG}: typing in any pane of the group syncs to the others; "
+            f"Ctrl-] q closes the group.\n"
         )
-        _mirror_herdr(h, tab_id, pane_ids)
     finally:
         h.close()
 
 
-def _mirror_herdr(h, tab_id, panes):
-    """Track the focused pane of the tab and mirror input to the others."""
-    stop = {"stop": False, "focused": None}
-    panes = list(panes)
+def run_herdr(hosts, opts):
+    """herdr backend: a tiled tab, one labeled wrapper pane per host."""
+    path = opts["socket_path"]
+    h = HerdrJson(path)
+    rdir = make_rdir()
 
-    h.request("events.subscribe", {
-        "subscriptions": [{"type": "pane.focused"}, {"type": "tab.focused"}],
+    if opts["current"]:
+        try:
+            cur = h.request("pane.current", {})
+            workspace_id = cur["pane"]["workspace_id"]
+        except Exception as e:
+            shutil.rmtree(rdir, ignore_errors=True)
+            die(f"could not read the current Herdr pane ({e}); is a pane focused?")
+        tabs = h.request("tab.list", {"workspace_id": workspace_id})["tabs"]
+        used = {t.get("label") for t in tabs}
+        label, n = opts["name"], 0
+        while label in used:
+            n += 1
+            label = f"{opts['name']}-{n}"
+        created_workspace = False
+        # A new tab in the current workspace, named after the group.
+        apply_params = {"workspace_id": workspace_id, "tab_label": label,
+                        "focus": True}
+    else:
+        ws = h.request("workspace.create",
+                       {"label": opts["name"], "cwd": opts["cwd"]})
+        workspace_id = ws["workspace"]["workspace_id"]
+        label = opts["name"]
+        created_workspace = True
+        # workspace.create seeds a default tab with one shell pane. Apply the
+        # layout to that tab (replacing the default pane) and rename it, so the
+        # new workspace has a single, group-named tab.
+        apply_params = {"tab_id": ws["tab"]["tab_id"], "focus": True}
+
+    panes = [
+        {
+            "type": "pane",
+            "label": host,
+            "cwd": opts["cwd"],
+            "command": pane_command(i, host, rdir, opts["program"], opts["ssh_options"]),
+        }
+        for i, host in enumerate(hosts)
+    ]
+    root = balanced_tree(panes)
+    try:
+        result = h.request("layout.apply", {**apply_params, "root": root})
+    except Exception as e:
+        # Roll back what was created so a failure leaves no orphan behind.
+        if not opts["current"]:
+            try:
+                h.request("workspace.close", {"workspace_id": workspace_id})
+            except Exception:
+                pass
+        shutil.rmtree(rdir, ignore_errors=True)
+        die(f"could not apply the layout: {e}")
+    layout = result["layout"]
+    tab_id = layout["tab_id"]
+    pane_ids = collect_pane_ids(layout["root"], [])
+
+    if not opts["current"]:
+        try:
+            h.request("tab.rename", {"tab_id": tab_id, "label": label})
+        except Exception:
+            pass
+
+    write_state(rdir, {
+        "backend": "herdr",
+        "socket": path,
+        "workspace": workspace_id,
+        "tab": tab_id,
+        "created_workspace": created_workspace,
+        "panes": pane_ids,
+        "labels": list(hosts),
     })
-    try:
-        lay = h.request("pane.layout", {"pane_id": panes[0]})
-        stop["focused"] = lay["layout"].get("focused_pane_id")
-    except Exception:
-        stop["focused"] = None
 
-    def tracker():
-        while not stop["stop"]:
-            ev = h.poll_event(timeout=1.0)
-            if ev is None:
+    sys.stderr.write(
+        f"{PROG}: {len(panes)} host(s) in tab '{label}' "
+        f"(workspace {workspace_id}, herdr)\n"
+        f"{PROG}: typing in any pane syncs to the others; "
+        f"Ctrl-] q closes the group.\n"
+    )
+
+
+# --------------------------------------------------------------------------
+# per-pane pty wrapper
+# --------------------------------------------------------------------------
+
+def write_all(fd, data):
+    while data:
+        n = os.write(fd, data)
+        data = data[n:]
+
+
+def pane(idx, rdir, label, cmd):
+    """Run `cmd` on a pty; mirror keystrokes to the sibling wrappers."""
+    my_sock = os.path.join(rdir, f"{idx}.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(my_sock)
+    out = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    out.settimeout(0.5)
+
+    pid, master = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as exc:
+            sys.stderr.write(f"{PROG}: cannot run {cmd[0]}: {exc}\n")
+            os._exit(127)
+
+    def sync_size(*_):
+        try:
+            size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGWINCH, sync_size)
+    sync_size()
+
+    broadcast = True
+    quitting = False
+    state_cache = {}
+
+    def state():
+        if not state_cache:
+            try:
+                with open(os.path.join(rdir, "state.json")) as fh:
+                    state_cache.update(json.load(fh))
+            except (OSError, ValueError):
+                pass
+        return state_cache
+
+    def tell(payload):
+        for path in glob.glob(os.path.join(rdir, "*.sock")):
+            if path == my_sock:
                 continue
-            data = ev.get("data", {})
-            if ev.get("event") == "pane_focused":
-                pid = data.get("pane_id")
-                if pid in panes:
-                    stop["focused"] = pid
+            try:
+                out.sendto(payload, path)
+            except OSError:
+                pass  # peer already gone
 
-    t = threading.Thread(target=tracker, daemon=True)
-    t.start()
+    def client():
+        st = state()
+        if not st:
+            return None
+        try:
+            if st["backend"] == "herdr":
+                return HerdrJson(st["socket"])
+            return HcCore(st["socket"])
+        except Exception:
+            return None
 
-    def on_sig(_s, _f):
-        stop["stop"] = True
+    def relabel():
+        st = state()
+        if not st:
+            return
+        suffix = "" if broadcast else " [solo]"
+        c = client()
+        if not c:
+            return
+        try:
+            if st["backend"] == "herdr":
+                for pane_id, name in zip(st.get("panes", []), st.get("labels", [])):
+                    try:
+                        c.request("pane.rename",
+                                  {"pane_id": pane_id, "label": name + suffix})
+                    except Exception:
+                        pass
+            else:
+                group = st.get("group", "cssh")
+                for term, name in zip(st.get("terminals", []), st.get("labels", [])):
+                    try:
+                        c.request("terminal.label",
+                                  {"terminal": term,
+                                   "labels": {"cssh": group, "host": name + suffix}})
+                    except Exception:
+                        pass
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
 
+    def quit_all():
+        nonlocal quitting
+        quitting = True
+        tell(b"Q")
+        shutil.rmtree(rdir, ignore_errors=True)
+        st = state()
+        if st and st.get("backend") == "herdr":
+            c = client()
+            if c:
+                try:
+                    if st.get("created_workspace"):
+                        c.request("workspace.close",
+                                  {"workspace_id": st["workspace"]})
+                    elif st.get("tab"):
+                        c.request("tab.close", {"tab_id": st["tab"]})
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+        # core backend: the panes close as the wrappers exit (best effort).
+
+    old = termios.tcgetattr(0)
+    tty.setraw(0)
+    stdin_open = True
     try:
-        signal.signal(signal.SIGINT, on_sig)
-        signal.signal(signal.SIGTERM, on_sig)
-    except ValueError:
-        pass
+        while not quitting:
+            rlist = [master, sock] + ([0] if stdin_open else [])
+            ready, _, _ = select.select(rlist, [], [])
 
-    try:
-        while not stop["stop"]:
-            select.select([], [], [], 0.5)
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break  # child closed the pty
+                if not data:
+                    break
+                write_all(1, data)
+
+            if sock in ready:
+                try:
+                    msg = sock.recv(CHUNK + 16)
+                except OSError:
+                    msg = b""
+                if msg[:1] == b"D":
+                    if broadcast:
+                        write_all(master, msg[1:])
+                elif msg[:1] == b"B":
+                    broadcast = msg[1:2] == b"1"
+                elif msg[:1] == b"Q":
+                    quitting = True
+
+            if 0 in ready:
+                data = os.read(0, 4096)
+                if not data:
+                    stdin_open = False
+                    continue
+                if data[:1] == PREFIX and len(data) <= 2:
+                    key = data[1:2]
+                    if not key:
+                        select.select([0], [], [])
+                        key = os.read(0, 1)
+                    if key == b"t":
+                        broadcast = not broadcast
+                        tell(b"B1" if broadcast else b"B0")
+                        relabel()
+                        continue
+                    if key == b"q":
+                        quit_all()
+                        continue
+                    data = PREFIX if key == b"]" else b""
+                if not data:
+                    continue
+                write_all(master, data)
+                if broadcast:
+                    for i in range(0, len(data), CHUNK):
+                        tell(b"D" + data[i:i + CHUNK])
     finally:
-        stop["stop"] = True
-        t.join(timeout=2)
+        try:
+            termios.tcsetattr(0, termios.TCSADRAIN, old)
+        except OSError:
+            pass
+        try:
+            os.unlink(my_sock)
+        except OSError:
+            pass
+
+    # If we are quitting but our pane has not been closed by the multiplexer,
+    # hang up the child so the reap below does not block.
+    if quitting:
+        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                break
+            try:
+                done, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                done = 1
+            if done:
+                break
+
+    try:
+        _, status = os.waitpid(pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+    except ChildProcessError:
+        code = 0
+    if code != 0 and not quitting:
+        # Keep the pane readable so connection errors can be seen.
+        print(f"\r\n[{PROG}] {label}: exited with status {code}. Press Enter to close.")
+        try:
+            sys.stdin.readline()
+        except (OSError, KeyboardInterrupt):
+            pass
+
+    # Last pane out cleans up the rendezvous directory.
+    if not glob.glob(os.path.join(rdir, "*.sock")):
+        shutil.rmtree(rdir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -600,7 +780,37 @@ def list_sockets():
 # --------------------------------------------------------------------------
 
 def main():
-    args = sys.argv[1:]
+    argv = sys.argv[1:]
+
+    # Internal wrapper mode: `herdr-cssh --pane N --dir D --label L -- CMD...`
+    # Split off the command at `--` so its own flags (e.g. ssh -p) are never
+    # parsed here.
+    if "--pane" in argv:
+        idx = rdir = None
+        label = ""
+        cmd = []
+        i = 0
+        while i < len(argv):
+            a = argv[i]
+            if a == "--pane":
+                i += 1
+                idx = int(argv[i])
+            elif a == "--dir":
+                i += 1
+                rdir = argv[i]
+            elif a == "--label":
+                i += 1
+                label = argv[i]
+            elif a == "--":
+                cmd = argv[i + 1:]
+                break
+            i += 1
+        if idx is None or not rdir or not cmd:
+            die("internal error: malformed --pane invocation")
+        pane(idx, rdir, label, cmd)
+        return
+
+    args = argv
     if args and args[0] in ("-h", "--help"):
         usage(0)
     if args and args[0] == "--list":
@@ -659,13 +869,10 @@ def main():
         "caller": caller,
     }
 
-    try:
-        if backend == "core":
-            run_core(hosts, opts)
-        else:
-            run_herdr(hosts, opts)
-    except KeyboardInterrupt:
-        pass
+    if backend == "core":
+        run_core(hosts, opts)
+    else:
+        run_herdr(hosts, opts)
 
 
 if __name__ == "__main__":
