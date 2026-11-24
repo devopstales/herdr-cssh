@@ -53,7 +53,7 @@ API:
 
 | Backend    | Detected when                          | What it does                                            |
 | ---------- | -------------------------------------- | ------------------------------------------------------- |
-| herdr-app  | `$HC_TERMINAL_SOCKET` is set (you're in a `hc`/`herdr-app` terminal) | a **tiled space** in the running Herdr window: `space.new` (or a tab with `-c`) for the first host, then `pane.split` right/down for the rest, so N hosts fill a grid — the tmux-cssh split view. Keystrokes typed in any pane of the group are mirrored to the others. |
+| herdr-app  | `$HC_TERMINAL_SOCKET` is set (you're in a `hc`/`herdr-app` terminal) | a **host grid in the tab you ran `herdr-cssh` from**: that pane **becomes the first host's session** (ssh runs in it) and the remaining hosts get one pane each (`pane.split` halving right/down) — exactly N host panes, no new space or tab, no leftover source pane. Keystrokes typed in the first pane are mirrored to the others; `Ctrl-C` stops the sync, the created host panes close, and that pane is returned to its shell. |
 | herdr      | `~/.config/herdr/herdr.sock` (or `$HERDR_SOCKET_PATH`) is live | a new **workspace** with a **tiled tab** — one labeled pane per host; keystrokes mirrored from the focused pane to the others |
 
 `herdr-cssh --list` shows the active backend and every candidate socket with
@@ -65,24 +65,35 @@ its state.
    is live), then the herdr JSON API (default-session socket, then named-session
    sockets).
 2. **Build the tiled layout.**
-   - *herdr-app*: `space.new --name <group> --folder <cwd> --argv [ssh, …host]`
-     for the first host (or `tab.new` in the current space with `-c`), then
-     `pane.split --direction right|down` on the first pane for each remaining
-     host, tiling them into a grid. Each terminal is labeled `cssh=<group>`,
-     `host=<name>`.
+   - *herdr-app*: the pane you ran `herdr-cssh` from becomes the first host's
+     session (ssh is spawned in it as a child process); the remaining hosts
+     get one pane each via `pane.split --direction right|down` halving
+     splits. Each host terminal is labeled `cssh=<group>`, `host=<name>`.
    - *herdr*: `workspace.create` (or reuse the current workspace with `-c`),
      then `layout.apply` with a balanced BSP split tree — one pane per host,
      each running `ssh <host>` and labeled.
 3. **Mirror keystrokes.**
-   - *herdr-app*: observes each terminal's surface and replays input to the
-     other terminals of the group via `terminal.send`.
+   - *herdr-app*: the source pane's tty is put in raw mode; every keystroke
+     is replayed on the remaining host panes (interactive attach,
+     herdr-core framed protocol) and fed to the first host. For ssh the
+     first host runs with `SSH_ASKPASS` forced to a small helper that
+     prints a password file `herdr-cssh` writes from your first typed line
+     — so you type the password once and it reaches all hosts — and
+     command input goes over a stdin pipe (with `-tt`, so the remote shell
+     gets a pty and echoes like the other panes). `Ctrl-C` (0x03) is
+     forwarded to all hosts, then the sync stops.
    - *herdr*: subscribes to `pane.focused` events, tracks the focused pane,
      and mirrors input to the others.
 
 ## Notes
 
-- A host whose SSH session exits (unreachable, auth failure, `exit`) closes its
-  pane; the rest of the grid stays and keeps syncing. Use `-o` to add ssh args
+- Password auth: type the password once at the first prompt — it is
+  delivered to every host (see above). The password file is removed on
+  stop.
+- A host (pane 2..N) whose SSH session exits (unreachable, auth failure,
+  `exit`) closes its pane; the rest of the grid stays and keeps syncing. If
+  the first host's session ends, its pane stays and typing from it reaches
+  the other panes only. Use `-o` to add ssh args
   (`-o ConnectTimeout=5`, `-o BatchMode=yes`, `-J` jump hosts, etc.).
 - The headless `herdr` server exits when no TUI client is attached; for the
   herdr backend, run `herdr` first (or attach a client), then run

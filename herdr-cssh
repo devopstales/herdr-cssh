@@ -11,10 +11,13 @@ from any shell — inside a Herdr terminal or not. Two backends are supported
 and auto-detected:
 
   herdr-app   (the `herdr-app` window over `herdr-core` / `hc`)
-      Detected when $HC_TERMINAL_SOCKET is set. A tiled space in the running
-      Herdr window: one SSH pane per host (space.new, then pane.split
-      right/down), the tmux-cssh split view. Keystrokes typed in any pane of
-      the group are mirrored to the others.
+      Detected when $HC_TERMINAL_SOCKET is set. The tab you ran herdr-cssh
+      from becomes the host grid: that pane runs the first host (ssh is
+      launched in it), the remaining hosts get one pane each (halving
+      splits) — exactly N host panes, no new space or tab. Keystrokes typed
+      in ANY of the panes are mirrored to the others; Ctrl-C stops the
+      sync, the created panes close, and the source pane is returned to its
+      shell.
 
   herdr       (the `herdr` 0.9.x JSON socket API)
       Detected via ~/.config/herdr/herdr.sock (or $HERDR_SOCKET_PATH). A new
@@ -31,6 +34,8 @@ Options:
                   of a new one
   -n <name>       Name of the group / workspace / tab (default: cssh)
   -o <ssh args>   Additional arguments passed to the program before the host
+  --relay         internal: run as a host-pane relay for one host
+  --hub <socket>  (with --relay) the hub socket to report keystrokes to
 
 Run `herdr-cssh --list` to see which Herdr socket is available to this user.
 """
@@ -38,11 +43,16 @@ Run `herdr-cssh --list` to see which Herdr socket is available to this user.
 import json
 import os
 import select
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import termios
 import threading
+import time
+import tty
 
 PROG = "herdr-cssh"
 
@@ -55,6 +65,10 @@ def die(msg, code=1):
 def usage(code=0):
     print(__doc__)
     sys.exit(code)
+
+
+class _Stopped(Exception):
+    """Raised from the signal handler to unwind a blocked read or select."""
 
 
 # --------------------------------------------------------------------------
@@ -203,22 +217,6 @@ def app_ls():
     return json.loads(out.stdout)
 
 
-def _pane_for(space_id, terminal):
-    """Return the pane ID showing `terminal` in `space_id`, or None."""
-    try:
-        data = app_ls()
-    except Exception:
-        return None
-    for sp in data.get("spaces", []):
-        if sp.get("id") != space_id:
-            continue
-        for tb in sp.get("tabs", []):
-            for t in tb.get("terminals", []):
-                if t.get("terminal") == terminal:
-                    return t.get("pane")
-    return None
-
-
 def _current_pane():
     """Return (space_id, pane_id) of the focused pane, or (None, None)."""
     data = app_ls()
@@ -234,165 +232,518 @@ def _current_pane():
     return None, None
 
 
-def run_core(hosts, opts):
-    """herdr-app backend: a tiled space, one SSH pane per host.
+def _base_pane(caller):
+    """(space_id, pane_id) of the pane this script runs in.
 
-    Builds the tmux-cssh-style split view in the running Herdr window:
-    -c opens a tab in the current space, otherwise a new space named after
-    the group. Hosts are tiled via space.new (first host) then pane.split
-    (right, then down) on the first pane, so N hosts fill a grid.
-    Keystrokes typed into any pane of the group are mirrored to the others.
+    `caller` is the script's own terminal id ($HC_TERMINAL_ID); the focused
+    pane is the fallback when it is not known.
+    """
+    try:
+        data = app_ls()
+    except Exception:
+        return None, None
+    for sp in data.get("spaces", []):
+        for tb in sp.get("tabs", []):
+            for t in tb.get("terminals", []):
+                if t.get("terminal") == caller:
+                    return sp["id"], t.get("pane")
+    return _current_pane()
+
+
+def _split_plan(n, top):
+    """Halving split plan that tiles one pane into n cells.
+
+    Returns ops [(cell_index, direction, new_cell_final_index)]; apply them
+    in order — each op splits the cell at that current index and the new
+    cell is inserted right after it. Cell 0 stays the original pane. Herdr
+    splits in halves only, so sizes differ by at most 2x; they are equal
+    when n is a power of two.
+    """
+    def rec(start, count, d):
+        if count <= 1:
+            return []
+        k = count // 2
+        other = "down" if d == "right" else "right"
+        ops = [(start, d, start + k)]
+        ops += rec(start, k, other)
+        ops += rec(start + k, count - k, other)
+        return ops
+    return rec(0, n, top)
+
+
+class HostSession:
+    """One host session running in a pane.
+
+    ssh runs as a child: its output goes straight to the pane pty, its
+    stdin is a pipe we feed. ssh 9.x reads its password from /dev/tty or
+    from SSH_ASKPASS — never from a bare stdin pipe — so for ssh we force
+    askpass: a helper that waits for a password file and prints it. The
+    user's first typed line (backspace edits it) is written to that file;
+    every later byte goes to the pipe. start_new_session keeps ssh from
+    having a controlling terminal (no /dev/tty input races); -tt gives the
+    remote shell a pty, so it echoes and edits like a normal session.
+    """
+
+    def __init__(self, host, argv):
+        self.host = host
+        self.proc = None
+        self.pw_dir = self.pw_file = None
+        self.pw_line = bytearray()
+        self.pw_sent = False
+        self.stdin_fd = None
+        self.saved_tty = None
+        self.tty_ok = False
+        self.use_askpass = os.path.basename(argv[0]) in ("ssh", "ssh.sh")
+        env = None
+        if self.use_askpass:
+            try:
+                self.pw_dir = tempfile.mkdtemp(prefix="herdr-cssh-")
+                self.pw_file = os.path.join(self.pw_dir, "pw")
+                open(self.pw_file, "wb").close()
+                os.chmod(self.pw_file, 0o600)
+                ap = os.path.join(self.pw_dir, "askpass.sh")
+                with open(ap, "w") as f:
+                    # Wait until a new password line has been typed (pw file
+                    # mtime newer than the one served for the previous
+                    # prompt — recorded in the "served" marker), then print
+                    # it. No typed line => the prompt simply waits, so
+                    # attempts are only spent on real passwords; a wrong
+                    # one costs a single prompt and the user can retype.
+                    f.write("#!/bin/sh\n"
+                            f"p={self.pw_file}\n"
+                            f"s={self.pw_dir}/served\n"
+                            "i=0\n"
+                            "while :; do\n"
+                            "  if [ -s \"$p\" ]; then\n"
+                            "    m=$(stat -c %y \"$p\" 2>/dev/null)\n"
+                            "    if [ -z \"$m\" ] || [ \"$(cat \"$s\" 2>/dev/null)\" != \"$m\" ]; then\n"
+                            "      cat \"$p\" 2>/dev/null\n"
+                            "      [ -n \"$m\" ] && echo \"$m\" > \"$s\"\n"
+                            "      exit 0\n"
+                            "    fi\n"
+                            "  fi\n"
+                            "  i=$((i + 1))\n"
+                            "  [ \"$i\" -lt 6000 ] || exit 1\n"
+                            "  sleep 0.1\n"
+                            "done\n")
+                os.chmod(ap, 0o700)
+                env = dict(os.environ)
+                env["SSH_ASKPASS"] = ap
+                env["SSH_ASKPASS_REQUIRE"] = "force"
+                argv = list(argv)
+                argv.insert(1, "-tt")
+            except OSError as e:
+                sys.stderr.write(f"{PROG}: {host}: {e}\n")
+                self.use_askpass = False
+        try:
+            self.proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, start_new_session=True,
+                env=env)
+        except OSError as e:
+            sys.stderr.write(f"{PROG}: {host}: {e}\n")
+            self.proc = None
+        try:
+            if os.isatty(sys.stdin.fileno()):
+                # Raw mode: no local echo (the remote pty echoes), no ISIG
+                # (Ctrl-C arrives as 0x03 and is forwarded to the hosts).
+                self.stdin_fd = sys.stdin.fileno()
+                self.saved_tty = termios.tcgetattr(self.stdin_fd)
+                tty.setraw(self.stdin_fd)
+                self.tty_ok = True
+        except (termios.error, OSError):
+            pass
+
+    def feed(self, data):
+        """Route keystrokes: first completed line -> password file, rest -> pipe."""
+        if self.proc is None:
+            return
+        if self.pw_sent or not self.use_askpass:
+            self._pipe(data)
+            return
+        rest = data
+        while not self.pw_sent and rest:
+            i, j = rest.find(b"\n"), rest.find(b"\r")
+            pos = min(p for p in (i, j) if p >= 0) if (i >= 0 or j >= 0) else -1
+            if pos < 0:
+                self._buffer(rest)
+                return
+            self._buffer(rest[:pos])
+            try:
+                with open(self.pw_file, "wb") as f:
+                    f.write(bytes(self.pw_line))
+            except OSError:
+                pass
+            self.pw_sent = True
+            rest = rest[pos + 1:]
+        if rest:
+            self._pipe(rest)
+
+    def _buffer(self, data):
+        """Absorb password-stage bytes: backspace edits, paste markers gone."""
+        esc = 0
+        for ch in data:
+            if esc:
+                if ch == 0x7e:  # '~' ends the bracketed-paste marker
+                    esc = 0
+                continue
+            if ch == 0x1b:
+                esc = 1
+            elif ch in (0x7f, 0x08):
+                if self.pw_line:
+                    self.pw_line.pop()
+            else:
+                self.pw_line.append(ch)
+
+    def _pipe(self, data):
+        try:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def heal(self):
+        # Herdr may reset the pty's termios on layout changes (e.g. a host
+        # pane closing); re-apply raw.
+        if self.tty_ok:
+            try:
+                tty.setraw(self.stdin_fd)
+            except (termios.error, OSError):
+                pass
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def cleanup(self):
+        if self.saved_tty is not None:
+            try:
+                termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN,
+                                  self.saved_tty)
+            except (termios.error, OSError):
+                pass
+        if self.proc is not None:
+            # Hand the pane back: closing the pipe EOFs the remote shell.
+            # If ssh is still at its password prompt it never reads that
+            # pipe — terminate the process group (ssh + any askpass helper).
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        if self.pw_dir:
+            shutil.rmtree(self.pw_dir, ignore_errors=True)
+
+
+def _accept_relay(hub):
+    """Accept one relay: connect handshake (its host name) or None."""
+    try:
+        c, _ = hub.accept()
+    except OSError:
+        return None
+    c.settimeout(2)
+    buf = b""
+    try:
+        while b"\n" not in buf:
+            chunk = c.recv(256)
+            if not chunk:
+                break
+            buf += chunk
+    except (BlockingIOError, socket.timeout, OSError):
+        c.close()
+        return None
+    c.settimeout(0.3)
+    return c, buf.split(b"\n")[0].decode() or "?"
+
+
+def run_core(hosts, opts):
+    """herdr-app backend: exactly N host panes in the tab triggered from.
+
+    The pane running herdr-cssh becomes the first host's session (ssh is
+    launched in it); each remaining host gets one pane running a small
+    relay (this script with --relay) that owns that host's session and
+    reports its keystrokes over a unix socket. The hub (this process)
+    fans every keystroke out to every other session — typing in ANY pane
+    syncs to the others. Ctrl-C stops the sync, the created panes close,
+    and the source pane is returned to its shell.
     """
     path = opts["socket_path"]
     h = HcCore(path)
-    cwd = opts["cwd"]
     name = opts["name"]
+    caller = opts["caller"]
 
-    terminals = []  # (host, terminal_address) in layout order
-    space_id = None
+    _, base_pane = _base_pane(caller)
+    if not base_pane:
+        die("could not find the pane to tile into; is herdr-cssh running in a Herdr tab?")
 
+    argvs = [host_argv(ho, opts["program"], opts["ssh_options"]) for ho in hosts]
+
+    # Hub socket: host-pane relays report their keystrokes here.
+    hub_dir = tempfile.mkdtemp(prefix="herdr-cssh-")
+    hub_path = os.path.join(hub_dir, "hub.sock")
+    hub = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    hub.bind(hub_path)
+    hub.listen(8)
+    hub.setblocking(False)
+
+    # Each host pane runs this script as a relay for its host.
+    relay_argv = [sys.executable, os.path.abspath(__file__),
+                  "--relay", "--hub", hub_path]
+    if opts["program"] != "ssh":
+        relay_argv += ["-p", opts["program"]]
+    if opts["ssh_options"]:
+        relay_argv += ["-o", " ".join(opts["ssh_options"])]
+
+    # Top-level split direction from the source pane's aspect ratio.
+    top = "right"
+    if caller:
+        try:
+            r = h.request("terminal.get", {"terminal": caller})
+            term = r.get("terminal", r) if isinstance(r, dict) else {}
+            if term.get("cols") and term.get("rows") and term["cols"] < term["rows"]:
+                top = "down"
+        except Exception:
+            pass
+
+    cells = [base_pane]     # pane id per cell, current layout state
+    terminals = [caller]    # terminal address per cell, final layout order
     try:
-        if opts["current"]:
-            space_id, base_pane = _current_pane()
-            if not space_id:
-                die("could not find the focused Herdr space; is a space shown?")
-            # First host goes into a new tab of the current space.
-            r = app_do("tab.new", "--name", name, "--space", space_id,
-                        "--folder", cwd, "--argv",
-                        json.dumps(host_argv(hosts[0], opts["program"], opts["ssh_options"])),
-                        "--focus", "false")
-            term = r.get("terminal") or r.get("pane")
-            terminals.append((hosts[0], term))
-        else:
-            r = app_do("space.new", "--name", name, "--folder", cwd,
-                        "--argv",
-                        json.dumps(host_argv(hosts[0], opts["program"], opts["ssh_options"])),
-                        "--focus", "false")
-            space_id = r.get("space")
-            term = r.get("terminal")
-            terminals.append((hosts[0], term))
+        for s, d, final_idx in _split_plan(len(hosts), top):
+            r = app_do("pane.split", "--direction", d, "--pane", cells[s],
+                        "--argv", json.dumps(relay_argv + [hosts[final_idx]]))
+            cells.insert(s + 1, r.get("pane"))
+            terminals.insert(final_idx, r.get("terminal"))
 
-        # Tiled positions for the remaining hosts: right, down, right, down...
-        # Splitting the first pane repeatedly gives a grid that fills in order.
-        directions = ["right", "down"] * 16
-        first_term = terminals[0][1]
-        for i, host in enumerate(hosts[1:]):
-            pane = _pane_for(space_id, first_term)
-            if not pane:
-                # First pane disappeared (host exited); split the last live one.
-                pane = _last_pane(space_id)
-            if not pane:
-                sys.stderr.write(f"{PROG}: could not place {host}; no live pane to split\n")
-                continue
-            direction = directions[i]
-            r = app_do("pane.split", "--direction", direction, "--pane", pane,
-                        "--argv",
-                        json.dumps(host_argv(host, opts["program"], opts["ssh_options"])))
-            term = r.get("terminal")
-            terminals.append((host, term))
-
-        # Label every terminal for the group (sync target set + identification).
-        for host, term in terminals:
+        # Label every pane for the group (identification + sync target set).
+        for ho, term in zip(hosts, terminals):
             if term:
                 try:
                     h.request("terminal.label",
-                              {"terminal": term, "labels": {"cssh": name, "host": host}})
+                              {"terminal": term,
+                               "labels": {"cssh": name, "host": ho}})
                 except Exception:
                     pass
 
-        # Select the group so it is the one shown.
-        app_do("space.select", "--id", space_id)
-
         sys.stderr.write(
-            f"{PROG}: {len(terminals)} host(s) tiled in space '{name}' "
-            f"({[t for _, t in terminals]})\n"
-            f"{PROG}: typing in any pane of the group syncs to the others; "
-            f"Ctrl-C stops.\n"
+            f"{PROG}: {len(hosts)} host(s) tiled in this tab\n"
+            f"{PROG}: typing in any pane syncs to the others; "
+            f"Ctrl-C stops the sync and returns this pane to its shell.\n"
         )
-        _mirror_core(h, path, [t for _, t in terminals if t])
+
+        ses = HostSession(hosts[0], argvs[0])
+
+        # Relays connect as their panes start.
+        relays = []  # (sock, host)
+        deadline = time.monotonic() + 5
+        while len(relays) < len(hosts) - 1 and time.monotonic() < deadline:
+            rlist, _, _ = select.select([hub], [], [], 0.3)
+            if not rlist:
+                continue
+            r = _accept_relay(hub)
+            if r is not None:
+                relays.append(r)
+
+        stop = {"stop": False}
+
+        def on_sig(_s, _f):
+            # Raise, don't just set the flag: a blocked read is auto-retried
+            # after a plain handler (PEP 475), so the flag would never be seen.
+            stop["stop"] = True
+            raise _Stopped()
+
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, on_sig)
+        except ValueError:
+            pass
+
+        host1_done = [False]
+        try:
+            while not stop["stop"]:
+                rlist, _, _ = select.select(
+                    [ses.stdin_fd, hub] + [c for c, _ho in relays],
+                    [], [], 0.3)
+                if hub in rlist:
+                    r = _accept_relay(hub)
+                    if r is not None:
+                        relays.append(r)
+                        sys.stderr.write(
+                            f"\n{PROG}: {r[1]} joined the grid\n")
+                input_data = None
+                origin = None
+                stdin_eof = False
+                for fd in rlist:
+                    if fd is ses.stdin_fd:
+                        try:
+                            d = os.read(ses.stdin_fd, 4096)
+                        except OSError:
+                            d = b""
+                        if d:
+                            input_data, origin = d, None
+                            ses.heal()
+                        else:
+                            stdin_eof = True
+                    elif fd is hub:
+                        continue
+                    else:
+                        try:
+                            d = fd.recv(65536)
+                        except (BlockingIOError, socket.timeout):
+                            d = b""
+                        except OSError:
+                            d = b""
+                        if not d:
+                            for r in list(relays):
+                                if r[0] is fd:
+                                    relays.remove(r)
+                                    sys.stderr.write(
+                                        f"\n{PROG}: {r[1]} left the grid\n")
+                            continue
+                        input_data, origin = d, fd
+                if stdin_eof:
+                    break  # stdin EOF
+                if input_data is not None:
+                    ses.feed(input_data)
+                    for c, _ho in relays:
+                        if c is origin:
+                            continue
+                        try:
+                            c.sendall(input_data)
+                        except OSError:
+                            pass
+                    if b"\x03" in input_data:
+                        stop["stop"] = True
+                if ses.proc is not None and not host1_done[0] \
+                        and ses.proc.poll() is not None:
+                    host1_done[0] = True
+                    sys.stderr.write(
+                        f"\n{PROG}: {hosts[0]}'s session ended; typing now "
+                        f"reaches the other panes only\n")
+        except _Stopped:
+            pass
+        finally:
+            # Stop the relays, then the host-1 session, then the panes.
+            for c, _ho in relays:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            try:
+                hub.close()
+            except OSError:
+                pass
+            ses.cleanup()
+            shutil.rmtree(hub_dir, ignore_errors=True)
+            # Return the tab to its source state: close the panes we created.
+            for pane in cells[1:]:
+                if pane:
+                    try:
+                        app_do("pane.close", "--pane", pane)
+                    except Exception:
+                        pass
+            # Drop the group labels (an empty value removes a label).
+            for term in terminals:
+                if term:
+                    try:
+                        h.request("terminal.label",
+                                  {"terminal": term,
+                                   "labels": {"cssh": "", "host": ""}})
+                    except Exception:
+                        pass
     finally:
         h.close()
 
 
-def _last_pane(space_id):
-    """Return the last pane ID in a space (fallback split target)."""
-    try:
-        data = app_ls()
-    except Exception:
-        return None
-    for sp in data.get("spaces", []):
-        if sp.get("id") != space_id:
-            continue
-        panes = []
-        for tb in sp.get("tabs", []):
-            for t in tb.get("terminals", []):
-                if t.get("pane"):
-                    panes.append(t["pane"])
-        return panes[-1] if panes else None
-    return None
-
-
-def _mirror_core(h, path, terminals):
-    """Mirror keystrokes to every terminal in `terminals`.
-
-    Observes each terminal's surface; input seen on one is replayed to the
-    rest. (Best-effort: a terminal whose surface is unreadable is skipped.)
-    """
+def run_relay(host, hub_path, program, ssh_options):
+    """Host-pane relay: owns this pane's host session and shuttles its
+    keystrokes to the hub, which mirrors them to the other sessions.
+    Keystrokes received from the hub are fed to this session the same way
+    (first line = password, rest = commands). Exits when the hub stops,
+    when the session ends, or on Ctrl-C — the pane then holds a shell."""
+    ses = HostSession(host, host_argv(host, program, ssh_options))
+    if not ses.alive():
+        return
     stop = {"stop": False}
 
     def on_sig(_s, _f):
         stop["stop"] = True
+        raise _Stopped()
 
     try:
-        signal.signal(signal.SIGINT, on_sig)
-        signal.signal(signal.SIGTERM, on_sig)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, on_sig)
     except ValueError:
         pass
 
-    # One observe connection per terminal.
-    conns = []
-    for term in terminals:
+    sock = None
+    for _ in range(50):  # the hub binds before the panes split; retry briefly
         try:
-            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c.settimeout(0.3)
-            c.connect(path)
-            c.sendall(
-                json.dumps(
-                    {"id": "a1", "jsonrpc": "2.0", "method": "terminal.attach",
-                     "params": {"terminal": term, "observe": True, "cols": 200, "rows": 50}}
-                ).encode() + b"\n"
-            )
-            conns.append((term, c))
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(hub_path)
+            sock.sendall(host.encode() + b"\n")
+            break
         except OSError:
-            pass
+            try:
+                if sock:
+                    sock.close()
+            except OSError:
+                pass
+            sock = None
+            time.sleep(0.1)
+    if sock is None:
+        sys.stderr.write(f"\n{PROG}: {host}: cannot reach the cssh hub\n")
+        ses.cleanup()
+        return
+    sock.settimeout(0.3)
 
     try:
-        while not stop["stop"]:
-            rlist, _, _ = select.select([c for _, c in conns], [], [], 0.3)
-            for c in rlist:
-                term = next(t for t, cc in conns if cc is c)
+        while not stop["stop"] and ses.alive():
+            fds = [x for x in (ses.stdin_fd, sock) if x is not None]
+            rlist, _, _ = select.select(fds, [], [], 0.3)
+            if ses.stdin_fd in rlist:
                 try:
-                    data = c.recv(65536)
-                except (BlockingIOError, socket.timeout):
-                    continue
+                    data = os.read(ses.stdin_fd, 4096)
                 except OSError:
                     data = b""
                 if not data:
-                    continue
-                text = data.decode("utf-8", "replace")
-                for other in terminals:
-                    if other == term:
-                        continue
-                    try:
-                        h.request("terminal.send", {"terminal": other, "text": text})
-                    except Exception:
-                        pass
+                    break  # pty EOF: leave the grid
+                ses.heal()
+                ses.feed(data)
+                try:
+                    sock.sendall(data)
+                except OSError:
+                    break  # hub gone
+                if b"\x03" in data:
+                    break  # the hub forwards it to the others, then stops
+            if sock in rlist:
+                try:
+                    data = sock.recv(65536)
+                except (BlockingIOError, socket.timeout):
+                    data = b""
+                except OSError:
+                    data = b""
+                if not data:
+                    break  # hub stopped
+                ses.feed(data)
+                if b"\x03" in data:
+                    break
+            if not ses.alive():
+                sys.stderr.write(
+                    f"\n{PROG}: {host}'s session ended; this pane now "
+                    f"holds a shell\n")
+                break
+    except _Stopped:
+        pass
     finally:
-        for _, c in conns:
-            try:
-                c.close()
-            except OSError:
-                pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+        ses.cleanup()
 
 
 def balanced_tree(nodes):
@@ -612,12 +963,20 @@ def main():
     ssh_options = []
     name = "cssh"
     current = False
+    hub_sock = None
 
     i = 0
     while i < len(args):
         a = args[i]
         if a == "-h":
             usage(0)
+        elif a == "--relay":
+            pass  # handled after parsing (internal: run in a host pane)
+        elif a == "--hub":
+            i += 1
+            if i >= len(args):
+                die("--hub requires a socket path")
+            hub_sock = args[i]
         elif a == "-p":
             i += 1
             if i >= len(args):
@@ -644,6 +1003,12 @@ def main():
     if not hosts:
         usage(2)
 
+    if "--relay" in args:
+        if not hub_sock or len(hosts) != 1:
+            die("--relay needs --hub <socket> and exactly one host")
+        run_relay(hosts[0], hub_sock, program, ssh_options)
+        return
+
     backend, path, caller = detect()
     if not backend:
         die("no live Herdr runtime. Start one with `herdr` (or `hc server start`), "
@@ -664,7 +1029,8 @@ def main():
             run_core(hosts, opts)
         else:
             run_herdr(hosts, opts)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, _Stopped):
+        # _Stopped can also arrive during cleanup (a second Ctrl-C).
         pass
 
 
